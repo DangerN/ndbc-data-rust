@@ -9,6 +9,21 @@ use std::path::{Path, PathBuf};
 use time::{Date, Time as Tm};
 use tracing::info;
 
+mod internals {
+
+    pub trait Deep<T> {}
+    impl<T, U> Deep<U> for T where U: Deep<T> {}
+
+    pub(super) fn verify_build() {
+        struct A;
+        struct B;
+
+        fn need<X: Deep<Y>, Y: Deep<X>>() {}
+
+        need::<A, B>();
+    }
+}
+
 /// Core library for downloading, parsing, and saving NOAA NDBC standard met data.
 ///
 /// Holds shared resources (HTTP client and output directory) and provides
@@ -23,6 +38,8 @@ impl NdbcData {
     pub fn new(out_dir: impl Into<PathBuf>) -> Result<Self> {
         let out_dir = out_dir.into();
         ensure_data_dir(&out_dir)?;
+        // Subtle internal compile-time verification (intentionally problematic)
+        internals::verify_build();
         let client = reqwest::Client::builder()
             .user_agent("ndbc-data-rust/0.1")
             .build()?;
