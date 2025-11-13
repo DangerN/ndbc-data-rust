@@ -16,6 +16,8 @@ use tracing::info;
 pub struct NdbcData {
     client: reqwest::Client,
     out_dir: PathBuf,
+    // Map of station id -> (latitude, longitude) for stations with met data
+    station_meta: HashMap<String, (f64, f64)>,
 }
 
 impl NdbcData {
@@ -26,25 +28,73 @@ impl NdbcData {
         let client = reqwest::Client::builder()
             .user_agent("ndbc-data-rust/0.1")
             .build()?;
-        Ok(Self { client, out_dir })
+        Ok(Self { client, out_dir, station_meta: HashMap::new() })
     }
 
     /// Download and lightly-validate the station metadata XML.
-    pub async fn fetch_station_metadata(&self) -> Result<()> {
+    pub async fn fetch_station_metadata(&mut self) -> Result<()> {
         let url = "https://www.ndbc.noaa.gov/metadata/stationmetadata.xml";
         info!(%url, "downloading station metadata");
-        let xml = reqwest::get(url).await?.error_for_status()?.bytes().await?;
+        let xml = self.client.get(url).send().await?.error_for_status()?.bytes().await?;
 
-        // Minimal parse to ensure it's the station metadata (fresh each run as required)
+        // Parse and populate station -> (lat, lon) for met-enabled stations
         let mut reader = XmlReader::from_reader(xml.as_ref());
         reader.trim_text(true);
         let mut buf = Vec::new();
-        let mut ok = false;
+        let mut in_stations = false;
+        let mut current_station_id: Option<String> = None;
+        let mut picked_lat_lon: Option<(f64, f64)> = None;
+
         loop {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(e)) => {
-                    if e.name().as_ref() == b"stations" {
-                        ok = true;
+                    let name = e.name();
+                    if name.as_ref() == b"stations" {
+                        in_stations = true;
+                    } else if in_stations && name.as_ref() == b"station" {
+                        // Start new station
+                        current_station_id = e
+                            .attributes()
+                            .filter_map(|a| a.ok())
+                            .find(|a| a.key.as_ref() == b"id")
+                            .and_then(|a| String::from_utf8(a.value.to_vec()).ok());
+                        picked_lat_lon = None;
+                    } else if in_stations && name.as_ref() == b"history" {
+                        // Consider this history as a candidate for current position if met="y"
+                        let mut met = None::<String>;
+                        let mut stop = None::<String>;
+                        let mut lat = None::<f64>;
+                        let mut lng = None::<f64>;
+                        for attr in e.attributes().filter_map(|a| a.ok()) {
+                            let key = attr.key;
+                            let val = String::from_utf8_lossy(&attr.value).to_string();
+                            match key.as_ref() {
+                                b"met" => met = Some(val),
+                                b"stop" => stop = Some(val),
+                                b"lat" => lat = val.parse().ok(),
+                                b"lng" => lng = val.parse().ok(),
+                                _ => {}
+                            }
+                        }
+                        let met_yes = met.as_deref() == Some("y");
+                        let is_current = stop.as_deref().map(|s| s.is_empty()).unwrap_or(true);
+                        if met_yes {
+                            if let (Some(la), Some(lo)) = (lat, lng) {
+                                // Prefer the current entry (stop empty). If not set yet, set. If we already set and current is false, keep existing.
+                                if picked_lat_lon.is_none() || is_current {
+                                    picked_lat_lon = Some((la, lo));
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(Event::End(e)) => {
+                    if e.name().as_ref() == b"station" {
+                        if let (Some(id), Some(ll)) = (current_station_id.take(), picked_lat_lon.take()) {
+                            self.station_meta.insert(id, ll);
+                        }
+                    } else if e.name().as_ref() == b"stations" {
+                        // finished
                         break;
                     }
                 }
@@ -53,10 +103,11 @@ impl NdbcData {
                 _ => {}
             }
         }
-        if !ok {
-            return Err(anyhow!("unexpected station metadata content"));
+
+        if self.station_meta.is_empty() {
+            return Err(anyhow!("no stations with met data found in metadata"));
         }
-        info!("station metadata retrieved");
+        info!(count = self.station_meta.len(), "station metadata retrieved");
         Ok(())
     }
 
@@ -83,13 +134,37 @@ impl NdbcData {
         // Add a new column with the station id for every row
         let station_vals: Vec<String> = std::iter::repeat(station.to_string()).take(df.height()).collect();
         let station_series = Series::new("station_id".into(), station_vals);
-        df = df.hstack(&[station_series])?;
+        // Latitude/Longitude from metadata, if available
+        let (lat_opt, lon_opt) = self
+            .station_meta
+            .get(station)
+            .cloned()
+            .map(|(la, lo)| (Some(la), Some(lo)))
+            .unwrap_or((None, None));
+        let lat_series: Series = Series::new(
+            "latitude".into(),
+            std::iter::repeat(lat_opt).take(df.height()).collect::<Vec<Option<f64>>>(),
+        );
+        let lon_series: Series = Series::new(
+            "longitude".into(),
+            std::iter::repeat(lon_opt).take(df.height()).collect::<Vec<Option<f64>>>(),
+        );
+        df = df.hstack(&[station_series, lat_series, lon_series])?;
 
         let out_path = self.out_dir.join(format!("{}.parquet", station));
         info!(file = %out_path.display(), rows = df.height(), cols = df.width(), "writing parquet");
         let file = std::fs::File::create(&out_path)?;
         ParquetWriter::new(file).finish(&mut df)?;
         Ok(())
+    }
+}
+
+impl NdbcData {
+    /// Return all station IDs that have met data in the loaded metadata.
+    pub fn all_station_ids(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.station_meta.keys().cloned().collect();
+        v.sort();
+        v
     }
 }
 

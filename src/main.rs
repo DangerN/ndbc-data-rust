@@ -9,7 +9,7 @@ use ndbc_data::NdbcData;
 #[command(name = "ndbc-data", version, about = "Fetch NDBC realtime standard meteorological data and save as Parquet")] 
 struct Args {
     /// Station identifiers to retrieve (e.g., 42040, 46042, FPKA2)
-    #[arg(required = true)]
+    #[arg(required = false)]
     stations: Vec<String>,
 
     /// Output directory for Parquet files (default: ./data)
@@ -23,16 +23,25 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     // Initialize core library with output directory
-    let core = NdbcData::new(args.out_dir)?;
+    let mut core = NdbcData::new(args.out_dir)?;
 
     // Fetch fresh station metadata every run.
     core.fetch_station_metadata().await?;
+
+    // Determine stations to process. If none specified, process all from metadata.
+    let stations: Vec<String> = if args.stations.is_empty() {
+        let all = core.all_station_ids();
+        info!(count = all.len(), "no stations specified; defaulting to all stations in metadata");
+        all
+    } else {
+        args.stations
+    };
 
     // Process each requested station.
     let mut successes = 0usize;
     let mut failures: Vec<(String, String)> = Vec::new();
 
-    for station in &args.stations {
+    for station in &stations {
         match core.fetch_and_save_station(station).await {
             Ok(_) => successes += 1,
             Err(e) => {
